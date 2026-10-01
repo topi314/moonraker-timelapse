@@ -64,6 +64,10 @@ class Timelapse:
             "ffmpeg_binary_path", "/usr/bin/ffmpeg")
         self.wget_skip_cert = confighelper.getboolean(
             "wget_skip_cert_check", False)
+        # go2rtc frame.jpeg decode can exceed 2s; frame.mp4 keyframe grabs
+        # still wait on the next IDR (~0.5-1s typical).
+        self.snapshot_timeout = confighelper.getfloat(
+            "snapshot_timeout", 10.)
 
         # Setup default config
         self.config: Dict[str, Any] = {
@@ -403,7 +407,15 @@ class Timelapse:
                                  + "in hyperlapse mode"
                                  )
             else:
-                self.spawn_newframe_callbacks()
+                # layermacro: same overlap guard — go2rtc frame.mp4 can take
+                # ~1s; stacking TIMELAPSE_TAKE_FRAME cancels wget mid-write.
+                if not self.takingframe:
+                    self.takingframe = True
+                    self.spawn_newframe_callbacks()
+                else:
+                    logging.info("last take frame hasn't completed"
+                                 + " ignoring take frame command"
+                                 )
         else:
             logging.info("NEW_FRAME macro ignored timelapse is disabled")
 
@@ -460,6 +472,18 @@ class Timelapse:
             logging.exception(msg)
         self.hyperlapserunning = False
 
+    def _uses_h264_frames(self) -> bool:
+        """True when snapshoturl points at a go2rtc/MP4 keyframe endpoint."""
+        url = self.config.get('snapshoturl', '').lower()
+        return 'frame.mp4' in url or url.rstrip('/').endswith('.mp4')
+
+    def _frame_ext(self) -> str:
+        return '.mp4' if self._uses_h264_frames() else '.jpg'
+
+    def _frame_glob(self) -> str:
+        return self.temp_dir + "frame[0-9][0-9][0-9][0-9][0-9][0-9]" \
+            + self._frame_ext()
+
     async def newframe(self) -> None:
         # make sure webcamconfig is uptodate before grabbing a new frame
         await self.getWebcamConfig()
@@ -469,8 +493,9 @@ class Timelapse:
             options += "--no-check-certificate "
 
         self.framecount += 1
-        framefile = "frame" + str(self.framecount).zfill(6) + ".jpg"
-        cmd = "wget " + options + self.config['snapshoturl'] \
+        framefile = "frame" + str(self.framecount).zfill(6) + self._frame_ext()
+        # Quote URL so '?' in go2rtc query strings is not treated as a glob.
+        cmd = "wget " + options + '"' + self.config['snapshoturl'] + '"' \
               + " -O " + self.temp_dir + framefile
         self.lastframefile = framefile
         logging.debug(f"cmd: {cmd}")
@@ -478,11 +503,25 @@ class Timelapse:
         shell_cmd: SCMDComp = self.server.lookup_component('shell_command')
         scmd = shell_cmd.build_shell_command(cmd, None)
         try:
-            cmdstatus = await scmd.run(timeout=2., verbose=False)
+            cmdstatus = await scmd.run(
+                timeout=self.snapshot_timeout, verbose=False)
         except Exception:
             logging.exception(f"Error running cmd '{cmd}'")
 
         result = {'action': 'newframe'}
+        # Reject empty/truncated downloads (cancelled overlapping wget, etc.)
+        out_path = self.temp_dir + framefile
+        if cmdstatus and (
+            not os.path.isfile(out_path) or os.path.getsize(out_path) < 1024
+        ):
+            logging.info(f"getting newframe failed: empty/short file {out_path}")
+            cmdstatus = False
+            try:
+                if os.path.isfile(out_path):
+                    os.remove(out_path)
+            except OSError:
+                pass
+
         if cmdstatus:
             result.update({
                 'frame': str(self.framecount),
@@ -537,10 +576,18 @@ class Timelapse:
 
     def cleanup(self) -> None:
         logging.debug("cleanup frame directory")
-        filelist = glob.glob(self.temp_dir + "frame*.jpg")
-        if filelist:
-            for filepath in filelist:
-                os.remove(filepath)
+        patterns = [
+            self.temp_dir + "frame*.jpg",
+            self.temp_dir + "frame*.mp4",
+            self.temp_dir + "frame*.h264",
+            self.temp_dir + "_tl_*.h264",
+        ]
+        for pattern in patterns:
+            for filepath in glob.glob(pattern):
+                try:
+                    os.remove(filepath)
+                except OSError as err:
+                    logging.info(f"cleanup remove failed: {err}")
         self.framecount = 0
         self.lastframefile = ""
 
@@ -549,7 +596,7 @@ class Timelapse:
         ioloop.spawn_callback(self.saveFramesZip)
 
     async def saveFramesZip(self, webrequest=None):
-        filelist = sorted(glob.glob(self.temp_dir + "frame*.jpg"))
+        filelist = sorted(glob.glob(self._frame_glob()))
         self.framecount = len(filelist)
         result = {'action': 'saveframes'}
 
@@ -596,9 +643,16 @@ class Timelapse:
         ioloop.spawn_callback(self.render)
 
     async def render(self, webrequest=None):
-        filelist = sorted(glob.glob(self.temp_dir + "frame*.jpg"))
+        filelist = [
+            p for p in sorted(glob.glob(self._frame_glob()))
+            if os.path.isfile(p) and os.path.getsize(p) >= 1024
+        ]
         self.framecount = len(filelist)
         result = {'action': 'render'}
+        ext = self._frame_ext()
+        h264_mode = self._uses_h264_frames()
+        cmd = ""
+        cmdstatus = False
 
         # make sure webcamconfig is uptodate for the rotation/flip feature
         await self.getWebcamConfig()
@@ -626,7 +680,6 @@ class Timelapse:
             # prepare output filename
             now = datetime.now()
             date_time = now.strftime(self.config['time_format_code'])
-            inputfiles = self.temp_dir + "frame%6d.jpg"
             outfile = f"timelapse_{gcodefilename}_{date_time}"
 
             # dublicate last frame
@@ -636,7 +689,7 @@ class Timelapse:
 
                 for i in range(self.config['duplicatelastframe']):
                     nextframe = str(self.framecount + i + 1).zfill(6)
-                    duplicate = "frame" + nextframe + ".jpg"
+                    duplicate = "frame" + nextframe + ext
                     duplicatePath = self.temp_dir + duplicate
                     duplicates.append(duplicatePath)
                     try:
@@ -645,7 +698,7 @@ class Timelapse:
                         logging.info(f"duplicating last frame failed: {err}")
 
                 # update Filelist
-                filelist = sorted(glob.glob(self.temp_dir + "frame*.jpg"))
+                filelist = sorted(glob.glob(self._frame_glob()))
                 self.framecount = len(filelist)
 
             # variable framerate
@@ -680,42 +733,121 @@ class Timelapse:
             elif self.config['flip_y']:
                 filterParam = " -vf 'vflip'"
 
-            # build shell command
-            cmd = self.ffmpeg_binary_path \
-                + " -r " + str(fps) \
-                + " -i '" + inputfiles + "'" \
-                + filterParam \
-                + " -threads 2 -g 5" \
-                + " -crf " + str(self.config['constant_rate_factor']) \
-                + " -vcodec libx264" \
-                + " -pix_fmt " + self.config['pixelformat'] \
-                + " -an" \
-                + " " + self.config['extraoutputparams'] \
-                + " '" + self.temp_dir + outfile + ".mp4' -y"
-
-            # log and notify ws
-            logging.info(f"start FFMPEG: {cmd}")
-            result.update({
-                'status': 'started',
-                'framecount': str(self.framecount),
-                'settings': {
-                    'framerate': fps,
-                    'crf': self.config['constant_rate_factor'],
-                    'pixelformat': self.config['pixelformat']
-                }
-            })
-
-            # run the command
+            out_mp4 = self.temp_dir + outfile + ".mp4"
             shell_cmd: SCMDComp = self.server.lookup_component('shell_command')
-            self.notify_event(result)
-            scmd = shell_cmd.build_shell_command(cmd, self.ffmpeg_cb)
-            try:
-                cmdstatus = await scmd.run(verbose=True,
-                                           log_complete=False,
-                                           timeout=9999999999,
-                                           )
-            except Exception:
-                logging.exception(f"Error running cmd '{cmd}'")
+            if h264_mode:
+                # Remux camera H.264 keyframes (go2rtc /api/frame.mp4) with
+                # forced output fps. Avoids JPEG decode+encode. Filters require
+                # a final re-encode. Driven from Python because moonraker's
+                # shell_command uses exec (no bash loops/&&).
+                annex = self.temp_dir + "_tl_all.h264"
+                one = self.temp_dir + "_tl_one.h264"
+                try:
+                    if os.path.isfile(annex):
+                        os.remove(annex)
+                except OSError:
+                    pass
+                with open(annex, "wb") as annex_fd:
+                    for frame_path in filelist:
+                        ext_cmd = (
+                            f"{self.ffmpeg_binary_path} -y -hide_banner "
+                            f"-loglevel error -i '{frame_path}' -c copy "
+                            f"-bsf:v h264_mp4toannexb -f h264 '{one}'"
+                        )
+                        scmd = shell_cmd.build_shell_command(ext_cmd)
+                        ok = await scmd.run(
+                            verbose=False, log_complete=False, timeout=60.)
+                        if not ok or not os.path.isfile(one):
+                            logging.info(
+                                f"h264 extract failed for {frame_path}")
+                            cmdstatus = False
+                            cmd = ext_cmd
+                            break
+                        with open(one, "rb") as one_fd:
+                            annex_fd.write(one_fd.read())
+                    else:
+                        if filterParam:
+                            cmd = (
+                                f"{self.ffmpeg_binary_path} -y -hide_banner "
+                                f"-fflags +genpts -r {fps} -i '{annex}'"
+                                f"{filterParam}"
+                                f" -threads 2 -g 5"
+                                f" -crf {self.config['constant_rate_factor']}"
+                                f" -vcodec libx264"
+                                f" -pix_fmt {self.config['pixelformat']}"
+                                f" -an {self.config['extraoutputparams']}"
+                                f" '{out_mp4}'"
+                            )
+                        else:
+                            cmd = (
+                                f"{self.ffmpeg_binary_path} -y -hide_banner "
+                                f"-fflags +genpts -r {fps} -i '{annex}'"
+                                f" -c copy -an -movflags +faststart"
+                                f" {self.config['extraoutputparams']}"
+                                f" '{out_mp4}'"
+                            )
+                        logging.info(f"start FFMPEG: {cmd}")
+                        result.update({
+                            'status': 'started',
+                            'framecount': str(self.framecount),
+                            'settings': {
+                                'framerate': fps,
+                                'crf': self.config['constant_rate_factor'],
+                                'pixelformat': self.config['pixelformat'],
+                                'h264_frames': True
+                            }
+                        })
+                        self.notify_event(result)
+                        scmd = shell_cmd.build_shell_command(
+                            cmd, self.ffmpeg_cb)
+                        try:
+                            cmdstatus = await scmd.run(
+                                verbose=True,
+                                log_complete=False,
+                                timeout=9999999999,
+                            )
+                        except Exception:
+                            logging.exception(f"Error running cmd '{cmd}'")
+                            cmdstatus = False
+            else:
+                inputfiles = self.temp_dir + "frame%6d.jpg"
+                # build shell command
+                cmd = self.ffmpeg_binary_path \
+                    + " -r " + str(fps) \
+                    + " -i '" + inputfiles + "'" \
+                    + filterParam \
+                    + " -threads 2 -g 5" \
+                    + " -crf " + str(self.config['constant_rate_factor']) \
+                    + " -vcodec libx264" \
+                    + " -pix_fmt " + self.config['pixelformat'] \
+                    + " -an" \
+                    + " " + self.config['extraoutputparams'] \
+                    + " '" + out_mp4 + "' -y"
+
+                # log and notify ws
+                logging.info(f"start FFMPEG: {cmd}")
+                result.update({
+                    'status': 'started',
+                    'framecount': str(self.framecount),
+                    'settings': {
+                        'framerate': fps,
+                        'crf': self.config['constant_rate_factor'],
+                        'pixelformat': self.config['pixelformat'],
+                        'h264_frames': False
+                    }
+                })
+
+                # run the command
+                self.notify_event(result)
+                scmd = shell_cmd.build_shell_command(cmd, self.ffmpeg_cb)
+                try:
+                    cmdstatus = await scmd.run(verbose=True,
+                                               log_complete=False,
+                                               timeout=9999999999,
+                                               )
+                except Exception:
+                    logging.exception(f"Error running cmd '{cmd}'")
+                    cmdstatus = False
 
             # check success
             if cmdstatus:
@@ -730,7 +862,7 @@ class Timelapse:
 
                 # move finished output file to output directory
                 try:
-                    shutil.move(self.temp_dir + outfile + ".mp4",
+                    shutil.move(out_mp4,
                                 self.out_dir + outfile + ".mp4")
                 except OSError as err:
                     logging.info(f"moving output file failed: {err}")
@@ -741,33 +873,49 @@ class Timelapse:
                     previewFilePath = self.out_dir + previewFile
                     previewSrc = filelist[-1:][0]
                     try:
-                        shutil.copy(previewSrc, previewFilePath)
-                    except OSError as err:
+                        if h264_mode:
+                            # last frame is an mp4 keyframe; extract a jpeg
+                            pcmd = (
+                                f"{self.ffmpeg_binary_path} -y -hide_banner "
+                                f"-loglevel error -i '{previewSrc}' "
+                                f"-frames:v 1 '{previewFilePath}'"
+                            )
+                            pscmd = shell_cmd.build_shell_command(pcmd)
+                            await pscmd.run(verbose=False,
+                                            log_complete=False,
+                                            timeout=60.)
+                        else:
+                            shutil.copy(previewSrc, previewFilePath)
+                    except Exception as err:
                         logging.info(f"copying preview image failed: {err}")
                     else:
-                        result.update({
-                            'previewimage': previewFile
-                        })
+                        if os.path.isfile(previewFilePath):
+                            result.update({
+                                'previewimage': previewFile
+                            })
 
-                    # apply rotation previewimage if needed
-                    if filterParam or self.config['extraoutputparams']:
-                        cmd = self.ffmpeg_binary_path \
-                            + " -i '" + previewFilePath + "'" \
-                            + filterParam \
-                            + " -an" \
-                            + " " + self.config['extraoutputparams'] \
-                            + " '" + previewFilePath + "' -y"
+                            # apply rotation previewimage if needed
+                            if filterParam or self.config['extraoutputparams']:
+                                cmd = self.ffmpeg_binary_path \
+                                    + " -i '" + previewFilePath + "'" \
+                                    + filterParam \
+                                    + " -an" \
+                                    + " " + self.config['extraoutputparams'] \
+                                    + " '" + previewFilePath + "' -y"
 
-                        logging.info(f"Rotate preview image cmd: {cmd}")
+                                logging.info(
+                                    f"Rotate preview image cmd: {cmd}")
 
-                        scmd = shell_cmd.build_shell_command(cmd)
-                        try:
-                            cmdstatus = await scmd.run(verbose=True,
-                                                       log_complete=False,
-                                                       timeout=9999999999,
-                                                       )
-                        except Exception:
-                            logging.exception(f"Error running cmd '{cmd}'")
+                                scmd = shell_cmd.build_shell_command(cmd)
+                                try:
+                                    cmdstatus = await scmd.run(
+                                        verbose=True,
+                                        log_complete=False,
+                                        timeout=9999999999,
+                                        )
+                                except Exception:
+                                    logging.exception(
+                                        f"Error running cmd '{cmd}'")
 
             else:
                 status = "error"
@@ -779,13 +927,23 @@ class Timelapse:
 
             self.renderisrunning = False
 
-            # cleanup duplicates
+            # cleanup duplicates and h264 scratch
             if duplicates:
                 for dupe in duplicates:
                     try:
                         os.remove(dupe)
                     except OSError as err:
                         logging.info(f"remove duplicate failed: {err}")
+            for scratch in (
+                self.temp_dir + "_tl_all.h264",
+                self.temp_dir + "_tl_one.h264",
+                self.temp_dir + "_tl_frames.txt",
+            ):
+                try:
+                    if os.path.isfile(scratch):
+                        os.remove(scratch)
+                except OSError:
+                    pass
 
         # log and notify ws
         logging.info(msg)
