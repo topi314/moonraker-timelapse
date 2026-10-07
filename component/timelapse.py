@@ -9,6 +9,7 @@ import os
 import glob
 import re
 import shutil
+import signal
 import asyncio
 from datetime import datetime
 from tornado.ioloop import IOLoop
@@ -18,7 +19,8 @@ from zipfile import ZipFile
 from typing import (
     TYPE_CHECKING,
     Dict,
-    Any
+    Any,
+    Optional
 )
 if TYPE_CHECKING:
     from confighelper import ConfigHelper
@@ -49,6 +51,10 @@ class Timelapse:
         self.hyperlapserunning = False
         self.printing = False
         self.noWebcamDb = False
+        self.record_proc: Optional[asyncio.subprocess.Process] = None
+        self.record_tmp_mp4: str = ""
+        self.record_tmp_jpg: str = ""
+        self.record_final_name: str = ""
 
         self.confighelper = confighelper
         self.server = confighelper.get_server()
@@ -64,6 +70,10 @@ class Timelapse:
             "ffmpeg_binary_path", "/usr/bin/ffmpeg")
         self.wget_skip_cert = confighelper.getboolean(
             "wget_skip_cert_check", False)
+        # Full-print remux source (native H.264 via go2rtc). Not a DB setting.
+        self.record_url = confighelper.get(
+            "record_url",
+            "http://127.0.0.1:1984/api/stream.mp4?src=webcam")
 
         # Setup default config
         self.config: Dict[str, Any] = {
@@ -497,6 +507,153 @@ class Timelapse:
         self.notify_event(result)
         self.takingframe = False
 
+    def _publish_record(self) -> str:
+        """Move finished temp recording into output_path. Returns final basename."""
+        name = self.record_final_name
+        tmp_mp4 = self.record_tmp_mp4
+        tmp_jpg = self.record_tmp_jpg
+        self.record_final_name = ""
+        self.record_tmp_mp4 = ""
+        self.record_tmp_jpg = ""
+
+        if not name or not tmp_mp4:
+            return ""
+
+        final_mp4 = os.path.join(self.out_dir, name + ".mp4")
+        final_jpg = os.path.join(self.out_dir, name + ".jpg")
+
+        try:
+            if not os.path.isfile(tmp_mp4) or os.path.getsize(tmp_mp4) < 1024:
+                logging.info(f"timelapse: discarding empty record {tmp_mp4}")
+                for path in (tmp_mp4, tmp_jpg):
+                    if path and os.path.isfile(path):
+                        os.remove(path)
+                return ""
+            shutil.move(tmp_mp4, final_mp4)
+            if tmp_jpg and os.path.isfile(tmp_jpg):
+                shutil.move(tmp_jpg, final_jpg)
+            logging.info(f"timelapse: published record -> {final_mp4}")
+            return name + ".mp4"
+        except Exception:
+            logging.exception("timelapse: failed to publish record")
+            return ""
+
+    async def start_full_record(self) -> None:
+        """Remux the live H.264 stream into frame_path; publish on stop."""
+        if not self.config['enabled']:
+            logging.info("timelapse: full record skipped (disabled)")
+            return
+        if not self.ffmpeg_installed:
+            logging.info("timelapse: full record skipped (ffmpeg missing)")
+            return
+        if self.record_proc is not None:
+            logging.info("timelapse: full record already running")
+            return
+
+        kresult = await self.klippy_apis.query_objects({'print_stats': None})
+        pstats = kresult.get("print_stats", {})
+        gcodefilename = pstats.get("filename", "").split("/")[-1] or "print"
+        now = datetime.now()
+        date_time = now.strftime(self.config['time_format_code'])
+        name = f"timelapse_{gcodefilename}_{date_time}"
+        # Stage under frame_path (disk), not output_path — publish on stop.
+        tmp_mp4 = os.path.join(self.temp_dir, name + ".mp4")
+        tmp_jpg = os.path.join(self.temp_dir, name + ".jpg")
+        self.record_final_name = name
+        self.record_tmp_mp4 = tmp_mp4
+        self.record_tmp_jpg = tmp_jpg
+
+        # Best-effort thumbnail for HelixScreen / file browser
+        try:
+            thumb_cmd = (
+                f"wget --timeout=5 -q "
+                f"{self.config['snapshoturl']} -O {tmp_jpg}"
+            )
+            if self.wget_skip_cert:
+                thumb_cmd = (
+                    f"wget --no-check-certificate --timeout=5 -q "
+                    f"{self.config['snapshoturl']} -O {tmp_jpg}"
+                )
+            shell_cmd: SCMDComp = self.server.lookup_component('shell_command')
+            scmd = shell_cmd.build_shell_command(thumb_cmd, None)
+            await scmd.run(timeout=6., verbose=False)
+        except Exception:
+            logging.exception("timelapse: thumbnail grab failed")
+
+        cmd = [
+            self.ffmpeg_binary_path,
+            "-hide_banner", "-loglevel", "error", "-y",
+            "-i", self.record_url,
+            "-c", "copy", "-an",
+            "-movflags", "+faststart",
+            tmp_mp4,
+        ]
+        logging.info(f"timelapse: starting full record -> {tmp_mp4}")
+        try:
+            self.record_proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except Exception:
+            self.record_proc = None
+            self.record_final_name = ""
+            self.record_tmp_mp4 = ""
+            self.record_tmp_jpg = ""
+            logging.exception("timelapse: failed to start ffmpeg record")
+            self.notify_event({
+                'action': 'record',
+                'status': 'error',
+                'msg': 'failed to start ffmpeg',
+            })
+            return
+
+        self.notify_event({
+            'action': 'record',
+            'status': 'started',
+            'outfile': name + ".mp4",
+        })
+
+    async def stop_full_record(self) -> None:
+        """Stop remux, finalize MP4 trailer, move into output_path."""
+        proc = self.record_proc
+        if proc is None:
+            return
+        self.record_proc = None
+
+        if proc.returncode is None:
+            logging.info(
+                f"timelapse: stopping full record -> {self.record_tmp_mp4}"
+            )
+            try:
+                proc.send_signal(signal.SIGINT)
+                await asyncio.wait_for(proc.wait(), timeout=20.0)
+            except asyncio.TimeoutError:
+                logging.info("timelapse: record stop timed out, killing ffmpeg")
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                logging.exception("timelapse: error stopping record")
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        else:
+            stderr = b""
+            if proc.stderr is not None:
+                stderr = await proc.stderr.read()
+            logging.info(
+                f"timelapse: record already exited rc={proc.returncode} "
+                f"err={stderr.decode('utf-8', errors='replace')}"
+            )
+
+        published = self._publish_record()
+        self.notify_event({
+            'action': 'record',
+            'status': 'finished' if published else 'error',
+            'outfile': published,
+        })
+
     async def handle_status_update(self, status: Dict[str, Any]) -> None:
         if 'print_stats' in status:
             printstats = status['print_stats']
@@ -505,35 +662,19 @@ class Timelapse:
                 if state == 'cancelled':
                     self.printing = False
                     ioloop = IOLoop.current()
-                    ioloop.spawn_callback(self.stop_hyperlapse)
+                    ioloop.spawn_callback(self.stop_full_record)
 
     async def handle_gcode_response(self, gresponse: str) -> None:
         if gresponse == "File selected":
-            # print_started
             self.cleanup()
             self.printing = True
-
-            # start hyperlapse if mode is set
-            if self.config['mode'] == "hyperlapse":
-                ioloop = IOLoop.current()
-                ioloop.spawn_callback(self.start_hyperlapse)
+            ioloop = IOLoop.current()
+            ioloop.spawn_callback(self.start_full_record)
 
         elif gresponse == "Done printing file":
-            # print_done
             self.printing = False
-
-            # stop hyperlapse if mode is set
-            if self.config['mode'] == "hyperlapse":
-                ioloop = IOLoop.current()
-                ioloop.spawn_callback(self.stop_hyperlapse)
-
-            if self.config['enabled']:
-                if self.config['saveframes']:
-                    ioloop = IOLoop.current()
-                    ioloop.spawn_callback(self.saveFramesZip)
-                if self.config['autorender']:
-                    ioloop = IOLoop.current()
-                    ioloop.spawn_callback(self.render)
+            ioloop = IOLoop.current()
+            ioloop.spawn_callback(self.stop_full_record)
 
     def cleanup(self) -> None:
         logging.debug("cleanup frame directory")
